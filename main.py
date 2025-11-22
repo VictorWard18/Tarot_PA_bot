@@ -190,12 +190,45 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         photo_data = fetch_and_rotate_image(filename, is_reversed)
 
         # Пока делаем заглушку по тексту
-        pos_text = "перевёрнутая" if is_reversed else "прямая"
-        caption = (
-            f"Твоя карта дня: {filename}\n"
-            f"Положение: {pos_text}\n\n"
-            f"Пока это тестовый текст. Позже сюда добавим красивую трактовку под выбранную сферу ✨"
-        )
+        title, text = get_card_text(filename, sess["sphere"], is_reversed, lang="ru")
+
+	caption = f"Карта дня — {title}\n\n{text}"
+
+# Загружаем meanings.json
+with open(os.path.join("data", "meanings.json"), "r", encoding="utf-8") as f:
+    MEANINGS = json.load(f)
+
+def card_key_from_filename(filename: str) -> str:
+    """
+    Превращает имя файла вида:
+    '7ofcups_upright.jpg'
+    → в ключ '7ofcups'
+    """
+    base = filename.split('.')[0]
+    key = base.replace("_upright", "").replace("_reversed", "")
+    return key
+
+def get_card_text(filename: str, sphere: str, reversed_card: bool, lang: str = "ru") -> tuple[str, str]:
+    """
+    Возвращает (title, text) для подписи:
+      title = '7 Кубков'
+      text = длинное описание под сферу
+    """
+    key = card_key_from_filename(filename)
+    data = MEANINGS.get(key)
+
+    if not data:
+        return (filename, "Описание пока не добавлено.")
+
+    title = data["meta"]["titles"].get(lang, data["meta"]["titles"]["ru"])
+
+    branch = "reversed" if reversed_card else "upright"
+    sphere_key = sphere if sphere in ("general", "work", "love", "health") else "general"
+
+    text = data[branch][sphere_key].get(lang, data[branch][sphere_key]["ru"])
+
+    return (title, text)
+
 
         await q.message.reply_photo(photo=photo_data, caption=caption)
 
