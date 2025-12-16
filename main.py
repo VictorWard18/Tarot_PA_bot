@@ -4,10 +4,29 @@ import datetime
 from io import BytesIO
 import re
 import json
-
 import sqlite3
 
-# Создаем БД для статистики
+from PIL import Image
+import requests
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+# =====================
+# БД для статистики (пока не используется в хэндлерах, оставляю как есть)
+# =====================
 conn = sqlite3.connect("stats.db", check_same_thread=False)
 cursor = conn.cursor()
 
@@ -21,22 +40,6 @@ CREATE TABLE IF NOT EXISTS stats (
 )
 """)
 conn.commit()
-
-
-from PIL import Image
-import requests
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
 
 # =====================
 # НАСТРОЙКИ
@@ -57,6 +60,78 @@ STATE = {}  # key: (user_id, date_str) -> {"sphere": ..., "choices": [...], "pic
 def today_str() -> str:
     """Дата как строка (можно потом привязать к часовому поясу Дубая)."""
     return datetime.date.today().isoformat()
+
+
+# =====================
+# UI: Главное меню + навигация
+# =====================
+
+MAIN_MENU = ReplyKeyboardMarkup(
+    [
+        ["🃏 Карта дня"],
+        ["ℹ️ Как это работает"],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+HOME_INLINE = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🏠 В начало", callback_data="nav:home")]
+])
+
+RESULT_INLINE = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🔁 Ещё раз", callback_data="nav:restart")],
+    [InlineKeyboardButton("🏠 В начало", callback_data="nav:home")],
+])
+
+SPHERE_RU = {
+    "work": "Работа",
+    "love": "Личная жизнь",
+    "health": "Здоровье",
+    "general": "Общая",
+}
+
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "🔮 *Карта дня*\n\nВыбери действие ниже 👇"
+    if update.message:
+        await update.message.reply_text(text, reply_markup=MAIN_MENU, parse_mode="Markdown")
+    else:
+        await update.effective_chat.send_message(text, reply_markup=MAIN_MENU, parse_mode="Markdown")
+
+
+async def show_spheres(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [
+        [InlineKeyboardButton("Работа", callback_data="sphere:work")],
+        [InlineKeyboardButton("Личная жизнь", callback_data="sphere:love")],
+        [InlineKeyboardButton("Здоровье", callback_data="sphere:health")],
+        [InlineKeyboardButton("Общая", callback_data="sphere:general")],
+        [InlineKeyboardButton("🏠 В начало", callback_data="nav:home")],
+    ]
+    text = "Выбери сферу, для которой хочешь получить карту дня:"
+    if update.message:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await update.effective_chat.send_message(text, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    if text == "🃏 Карта дня":
+        await show_spheres(update, context)
+        return
+
+    if text == "ℹ️ Как это работает":
+        await update.message.reply_text(
+            "Ты выбираешь сферу и одну из трёх карт.\n"
+            "Карта дня подскажет энергию и фокус дня 🔮",
+            reply_markup=HOME_INLINE
+        )
+        return
+
+    # Любой другой текст — мягко возвращаем в меню
+    await show_main_menu(update, context)
 
 
 # =====================
@@ -98,7 +173,7 @@ def split_concatenated_json_objects(text: str):
             elif ch == "}":
                 depth -= 1
                 if depth == 0 and start is not None:
-                    objects.append(text[start : i + 1])
+                    objects.append(text[start: i + 1])
                     start = None
 
     return objects
@@ -117,7 +192,6 @@ def infer_card_id(obj: dict) -> str:
     if arcana == "major":
         base = en or ru
         base = base.lower()
-        # убираем всё, кроме латинских букв и цифр
         cid = re.sub(r"[^a-z0-9]+", "", base)
         return cid or "majorarcana"
 
@@ -179,7 +253,6 @@ def infer_card_id(obj: dict) -> str:
 
         return f"{rank}of{suit}"
 
-    # запасной вариант
     base = en or ru or "card"
     return re.sub(r"[^a-z0-9]+", "", base.lower()) or "card"
 
@@ -210,16 +283,13 @@ def load_meanings(path: str) -> dict:
             continue
 
         keys = list(obj.keys())
-        # Вариант 1: уже есть card_id на верхнем уровне: {"7ofcups": {...}}
         if len(keys) == 1 and keys[0] not in ("meta", "upright", "reversed"):
             card_id = keys[0]
             card_data = obj[card_id]
-        # Вариант 2: голый блок карты: {"meta": {...}, "upright": {...}, "reversed": {...}}
         elif set(keys) == {"meta", "upright", "reversed"}:
             card_id = infer_card_id(obj)
             card_data = obj
         else:
-            # неожиданный формат — пропускаем
             print(f"Неожиданный формат блока #{idx} в meanings.json, ключи: {keys}")
             continue
 
@@ -240,19 +310,13 @@ MEANINGS = load_meanings(MEANINGS_PATH)
 def get_card_text(filename: str, sphere: str, is_reversed: bool, lang: str = "ru"):
     """
     Возвращаем (title, text) для карты из MEANINGS.
-
-    filename: имя файла карты (например, '7ofcups_upright.jpg')
-    sphere: 'general' | 'work' | 'love' | 'health'
-    is_reversed: True, если карта перевёрнута
-    lang: 'ru' или 'en'
     """
     base = os.path.splitext(os.path.basename(filename))[0]
 
-    # card_id из имени файла
     if base.endswith("_upright"):
-        card_id = base[: -len("_upright")]
+        card_id = base[:-len("_upright")]
     elif base.endswith("_reversed"):
-        card_id = base[: -len("_reversed")]
+        card_id = base[:-len("_reversed")]
     else:
         card_id = base
 
@@ -260,7 +324,6 @@ def get_card_text(filename: str, sphere: str, is_reversed: bool, lang: str = "ru
 
     card_data = MEANINGS.get(card_id)
     if not card_data:
-        # Фолбэк, если карта не найдена
         title = card_id
         text = "Описание этой карты пока не добавлено."
         return title, text
@@ -289,7 +352,6 @@ def get_card_text(filename: str, sphere: str, is_reversed: bool, lang: str = "ru
 # РАБОТА С КАРТИНКАМИ
 # =====================
 
-
 def load_card_filenames():
     """
     Возвращает список файлов карт из папки assets.
@@ -300,8 +362,7 @@ def load_card_filenames():
         raise RuntimeError(f"Папка assets не найдена по пути: {assets_dir}")
 
     files = [
-        f
-        for f in os.listdir(assets_dir)
+        f for f in os.listdir(assets_dir)
         if f.lower().endswith((".jpg", ".jpeg", ".png"))
     ]
     files.sort()
@@ -317,21 +378,18 @@ NUM_CARDS = len(CARD_FILES)
 def draw_three_cards():
     """
     Выбираем 3 уникальных карты по индексам и случайно решаем, перевёрнутые они или нет.
-    Возвращаем список вида: [{"idx": int, "rev": bool}, ...]
     """
     idxs = random.sample(range(NUM_CARDS), 3)
     return [{"idx": i, "rev": random.random() < 0.5} for i in idxs]
 
 
 def get_card_filename(card_idx: int) -> str:
-    """Получаем имя файла по индексу карты."""
     return CARD_FILES[card_idx]
 
 
 def fetch_and_rotate_image(filename: str, reversed_card: bool) -> BytesIO:
     """
     Скачиваем картинку по raw-URL из GitHub и при необходимости переворачиваем на 180°.
-    Возвращаем BytesIO, готовый для отправки в Telegram.
     """
     url = f"{BASE_CDN}/{filename}"
     resp = requests.get(url)
@@ -343,13 +401,16 @@ def fetch_and_rotate_image(filename: str, reversed_card: bool) -> BytesIO:
         img = img.rotate(180, expand=True)
 
     output = BytesIO()
-    img.save(output, format="JPEG")
+    if img.mode in ("RGBA", "LA"):
+        img.save(output, format="PNG")
+    else:
+        img = img.convert("RGB")
+        img.save(output, format="JPEG")
     output.seek(0)
     return output
 
 
 def session_key(user_id: int):
-    """Ключ для STATE: (user_id, сегодняшняя дата)."""
     return (user_id, today_str())
 
 
@@ -357,32 +418,44 @@ def session_key(user_id: int):
 # ХЕНДЛЕРЫ БОТА
 # =====================
 
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старт / выбор сферы для карты дня."""
-    kb = [
-        [InlineKeyboardButton("Работа", callback_data="sphere:work")],
-        [InlineKeyboardButton("Личная жизнь", callback_data="sphere:love")],
-        [InlineKeyboardButton("Здоровье", callback_data="sphere:health")],
-        [InlineKeyboardButton("Общая", callback_data="sphere:general")],
-    ]
-    text = "Выбери сферу, для которой хочешь получить карту дня:"
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    # /start всегда ведёт в главное меню
+    await show_main_menu(update, context)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатий на кнопки (выбор сферы и выбор карты 1–3)."""
     q = update.callback_query
     await q.answer()
-    data = q.data
+    data = q.data or ""
     user_id = q.from_user.id
     key = session_key(user_id)
 
-    # Пользователь выбрал сферу
+    # ---------------------
+    # NAV
+    # ---------------------
+    if data == "nav:home":
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await show_main_menu(update, context)
+        return
+
+    if data == "nav:restart":
+        STATE.pop(key, None)
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await show_spheres(update, context)
+        return
+
+    # ---------------------
+    # Выбор сферы
+    # ---------------------
     if data.startswith("sphere:"):
         sphere = data.split(":", 1)[1]
 
-        # генерируем тройку карт
         picks = draw_three_cards()
         STATE[key] = {
             "sphere": sphere,
@@ -390,18 +463,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "picked": None,
         }
 
-        kb = [[
-            InlineKeyboardButton("1️⃣", callback_data="pick:0"),
-            InlineKeyboardButton("2️⃣", callback_data="pick:1"),
-            InlineKeyboardButton("3️⃣", callback_data="pick:2"),
-        ]]
+        kb = [
+            [
+                InlineKeyboardButton("1️⃣", callback_data="pick:0"),
+                InlineKeyboardButton("2️⃣", callback_data="pick:1"),
+                InlineKeyboardButton("3️⃣", callback_data="pick:2"),
+            ],
+            [InlineKeyboardButton("🏠 В начало", callback_data="nav:home")],
+        ]
 
-        sphere_ru = {
-            "work": "Работа",
-            "love": "Личная жизнь",
-            "health": "Здоровье",
-            "general": "Общая",
-        }.get(sphere, "Общая")
+        sphere_ru = SPHERE_RU.get(sphere, "Общая")
 
         await q.edit_message_text(
             f"Сфера: {sphere_ru}\n\nТеперь выбери одну из трёх закрытых карт:",
@@ -409,18 +480,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Пользователь выбрал одну из трёх карт
+    # ---------------------
+    # Выбор 1 из 3 карт
+    # ---------------------
     if data.startswith("pick:"):
         idx_in_three = int(data.split(":", 1)[1])
 
         sess = STATE.get(key)
         if not sess:
-            await q.edit_message_text("Сессия не найдена. Нажми /start, чтобы начать заново.")
+            await q.edit_message_text(
+                "Сессия не найдена. Нажми /start, чтобы начать заново.",
+                reply_markup=HOME_INLINE
+            )
             return
 
-        # уже выбирал карту сегодня
         if sess.get("picked") is not None:
             await q.answer("Карта уже выбрана на сегодня ✨", show_alert=True)
+            await q.message.reply_text("Хочешь ещё раз или в начало?", reply_markup=RESULT_INLINE)
             return
 
         if idx_in_three not in (0, 1, 2):
@@ -428,19 +504,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         pick = sess["choices"][idx_in_three]
-        sess["picked"] = idx_in_three  # фиксируем выбор
+        sess["picked"] = idx_in_three
 
         card_idx = pick["idx"]
         is_reversed = pick["rev"]
         filename = get_card_filename(card_idx)
 
-        # Получаем картинку, повёрнутую при необходимости
         photo_data = fetch_and_rotate_image(filename, is_reversed)
 
-        # Текст из meanings.json
         title, text = get_card_text(filename, sess["sphere"], is_reversed, lang="ru")
 
-        # Если текст уже содержит заголовок, не дублируем
         if text.startswith("Карта дня —"):
             caption = text
         else:
@@ -449,8 +522,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_photo(
             photo=photo_data,
             caption=caption,
+            reply_markup=RESULT_INLINE,
         )
+
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
+
+    # fallback
+    await show_main_menu(update, context)
 
 
 def main():
@@ -461,7 +543,11 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("day", start))  # /day как алиас
+
     app.add_handler(CallbackQueryHandler(callback_handler))
+
+    # ReplyKeyboard (главное меню)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_handler))
 
     print("Бот запущен. Нажми Ctrl+C для остановки.")
     app.run_polling()
